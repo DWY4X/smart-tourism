@@ -1,0 +1,58 @@
+# =========================
+# Python virtual environment
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# VS Code
+# =========================
+.vscode/
+
+# =========================
+# Outputs / generated files
+# =========================
+outputs/
+*.parquet
+*.csv
+*.xlsx
+
+# Keep this commented if you want to upload processed CSV results
+# outputs/csv/
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Spark local files
+# =========================
+spark-warehouse/
+metastore_db/
+derby.log
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
