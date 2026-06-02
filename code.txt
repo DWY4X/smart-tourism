@@ -1,0 +1,266 @@
+import time
+import pandas as pd
+from collections import deque
+from pyspark.sql import functions as F
+
+# ── Tham số toàn cục ───────────────────────────────────────────────────────
+BFS_BUDGET_MIN = 480   # 8 giờ
+BFS_MAX_POIS   = 5     # độ sâu tối đa (tăng lên 6-7 nếu RAM cho phép)
+BFS_TOP_K      = 3     # số itinerary tốt nhất lưu lại mỗi user
+
+# ── Chuẩn bị dữ liệu pandas một lần, tránh collect lặp ───────────────────
+profit_pdf_all  = profit_df.toPandas()
+avg_dur_pdf_all = avg_dur_df.toPandas()
+# dist_pdf đã là pandas từ cell load dữ liệu
+
+all_cities = sorted(profit_pdf_all["city"].dropna().unique().tolist())
+print(f"Tổng số thành phố: {len(all_cities)}")
+print(f"Cities: {all_cities}")
+
+# ── Hàm BFS (giữ nguyên logic, chỉ đổi scope gọi) ────────────────────────
+def run_bfs_for_user(city, user_id, profit_pdf, dur_pdf, dist_pdf_city,
+                     budget_min=480, max_pois=5, top_k=3):
+    profit_map = dict(zip(profit_pdf["id"], profit_pdf["profit"]))
+    dur_map    = {str(int(r["poiID"])): r["dur_avg_min"]
+                  for _, r in dur_pdf.iterrows()}
+    travel_map = {}
+    for _, r in dist_pdf_city.iterrows():
+        travel_map[(str(int(r["fromPOIid"])), str(int(r["toPOIid"])))] = \
+            r["duration"] / 60
+
+    all_ids = list(profit_map.keys())
+    queue, results, visited = deque(), [], set()
+
+    for start_id in all_ids:
+        poi_num = start_id.split("_", 1)[-1]
+        dur = dur_map.get(poi_num, 30)
+        if dur <= budget_min:
+            queue.append((start_id, [start_id], profit_map.get(start_id, 0), dur))
+
+    while queue:
+        cur_id, path, total_profit, total_time = queue.popleft()
+        key = tuple(path)
+        if key not in visited:
+            visited.add(key)
+            results.append((list(path), total_profit, total_time))
+        if len(path) >= max_pois:
+            continue
+        cur_num = cur_id.split("_", 1)[-1]
+        for next_id in all_ids:
+            if next_id in path:
+                continue
+            next_num = next_id.split("_", 1)[-1]
+            travel   = travel_map.get((cur_num, next_num), 999)
+            stay     = dur_map.get(next_num, 30)
+            new_time = total_time + travel + stay
+            if new_time <= budget_min:
+                queue.append((next_id, path + [next_id],
+                              total_profit + profit_map.get(next_id, 0),
+                              new_time))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:top_k]
+
+
+# ── Chạy toàn bộ city × user ──────────────────────────────────────────────
+all_bfs_rows = []
+total_start  = time.time()
+
+for city in all_cities:
+    city_start = time.time()
+
+    profit_city = profit_pdf_all[profit_pdf_all["city"] == city].copy()
+    dur_city    = avg_dur_pdf_all[avg_dur_pdf_all["city"] == city].copy()
+    dist_city   = dist_pdf[dist_pdf["city"] == city].copy()
+
+    # Tra tên POI nhanh bằng dict
+    id_to_name  = dict(zip(profit_city["id"], profit_city["poiName"]))
+
+    all_users = profit_city["userID"].dropna().unique().tolist()
+    n_users   = len(all_users)
+
+    print(f"\n{'─'*60}")
+    print(f"[{city}]  {n_users} users | POIs: {dist_city['fromPOIid'].nunique()}")
+
+    city_rows = []
+    for u_idx, user_id in enumerate(all_users):
+        user_profit = profit_city[profit_city["userID"] == user_id]
+        if user_profit.empty:
+            continue
+
+        itineraries = run_bfs_for_user(
+            city, user_id,
+            profit_pdf    = user_profit,
+            dur_pdf       = dur_city,
+            dist_pdf_city = dist_city,
+            budget_min    = BFS_BUDGET_MIN,
+            max_pois      = BFS_MAX_POIS,
+            top_k         = BFS_TOP_K,
+        )
+
+        for rank, (path, profit, time_min) in enumerate(itineraries, 1):
+            names = [id_to_name.get(p, p).replace("_", " ") for p in path]
+            city_rows.append({
+                "city":          city,
+                "userID":        user_id,
+                "rank":          rank,
+                "path_ids":      "|".join(path),
+                "path_names":    " → ".join(names),
+                "n_pois":        len(path),
+                "total_profit":  round(profit, 4),
+                "total_time_min":round(time_min, 1),
+            })
+
+        # Progress mỗi 50 user
+        if (u_idx + 1) % 50 == 0 or (u_idx + 1) == n_users:
+            print(f"  {u_idx+1:>4}/{n_users} users done "
+                  f"({time.time()-city_start:.0f}s elapsed)")
+
+    all_bfs_rows.extend(city_rows)
+    print(f"  ✓ {len(city_rows)} itinerary rows — "
+          f"{time.time()-city_start:.1f}s")
+
+# ── Tổng hợp và lưu ───────────────────────────────────────────────────────
+bfs_df = pd.DataFrame(all_bfs_rows)
+print(f"\n{'='*60}")
+print(f"Tổng rows: {len(bfs_df):,} | {len(all_cities)} cities | "
+      f"{bfs_df['userID'].nunique():,} unique users")
+print(f"Wall time: {time.time()-total_start:.1f}s")
+
+# Lưu Parquet để tầng 2 dùng
+bfs_spark_df = spark.createDataFrame(bfs_df)
+bfs_spark_df.write.mode("overwrite").partitionBy("city") \
+    .parquet(str(output_path / "bfs_itineraries"))
+
+# Lưu CSV để xem nhanh
+bfs_df.to_csv(output_path / "bfs_itineraries_all.csv", index=False)
+print("✓ Đã lưu bfs_itineraries/ (Parquet, partitioned by city)")
+print("✓ Đã lưu bfs_itineraries_all.csv")
+
+# Thống kê tóm tắt theo city
+summary = (
+    bfs_df[bfs_df["rank"] == 1]   # chỉ itinerary tốt nhất mỗi user
+    .groupby("city")
+    .agg(
+        n_users       = ("userID",        "nunique"),
+        avg_profit    = ("total_profit",  "mean"),
+        avg_pois      = ("n_pois",        "mean"),
+        avg_time_min  = ("total_time_min","mean"),
+    )
+    .round(3)
+)
+print("\nThống kê BFS (itinerary rank-1) theo city:")
+print(summary.to_string())
+
+
+import time
+
+# ── Motif finding toàn bộ đồ thị (tất cả city cùng lúc) ──────────────────
+# GraphFrames chạy trên toàn graph nên không cần vòng lặp city
+# → filter kết quả theo city sau
+
+print("Đang chạy motif finding (a)→(b)→(c) trên toàn bộ đồ thị...")
+t0 = time.time()
+
+motifs_raw = g.find("(a)-[e1]->(b); (b)-[e2]->(c)")
+
+motifs_all = (
+    motifs_raw
+    # Chỉ lấy motif cùng city
+    .filter(F.col("a.city") == F.col("b.city"))
+    .filter(F.col("b.city") == F.col("c.city"))
+    # Không trùng POI trong bộ 3
+    .filter(F.col("a.id") != F.col("b.id"))
+    .filter(F.col("b.id") != F.col("c.id"))
+    .filter(F.col("a.id") != F.col("c.id"))
+    .select(
+        F.col("a.city").alias("city"),
+        F.col("a.id").alias("id_A"),
+        F.col("b.id").alias("id_B"),
+        F.col("c.id").alias("id_C"),
+        F.col("a.poiName").alias("poi_A"),
+        F.col("b.poiName").alias("poi_B"),
+        F.col("c.poiName").alias("poi_C"),
+        F.col("a.category").alias("cat_A"),
+        F.col("b.category").alias("cat_B"),
+        F.col("c.category").alias("cat_C"),
+        F.col("e1.duration").alias("travel_AB_sec"),
+        F.col("e2.duration").alias("travel_BC_sec"),
+    )
+    .withColumn(
+        "total_travel_min",
+        F.round((F.col("travel_AB_sec") + F.col("travel_BC_sec")) / 60, 2)
+    )
+    # Chỉ giữ motif đi lại tổng ≤ 30 phút (cấu hình tùy chỉnh)
+    .filter(F.col("total_travel_min") <= 30)
+    .orderBy("city", "total_travel_min")
+    .cache()   # cache vì sẽ dùng nhiều lần bên dưới
+)
+
+total_motifs = motifs_all.count()
+print(f"✓ Tổng số motif (A→B→C, travel ≤ 30 phút): {total_motifs:,}")
+print(f"  Wall time: {time.time()-t0:.1f}s")
+
+# ── Thống kê số motif theo city ───────────────────────────────────────────
+print("\nSố motif theo city:")
+motif_city_count = (
+    motifs_all
+    .groupBy("city")
+    .count()
+    .withColumnRenamed("count", "n_motifs")
+    .orderBy(F.col("n_motifs").desc())
+)
+motif_city_count.show(20, truncate=False)
+
+# ── Top-5 motif ngắn nhất mỗi city ───────────────────────────────────────
+print("Top-5 motif đường đi ngắn nhất mỗi city:")
+from pyspark.sql import Window
+
+city_rank_window = Window.partitionBy("city").orderBy("total_travel_min")
+
+top_motifs_per_city = (
+    motifs_all
+    .withColumn("city_rank", F.row_number().over(city_rank_window))
+    .filter(F.col("city_rank") <= 5)
+    .select("city", "city_rank", "poi_A", "poi_B", "poi_C",
+            "cat_A", "cat_B", "cat_C", "total_travel_min")
+    .orderBy("city", "city_rank")
+)
+top_motifs_per_city.show(65, truncate=False)   # 13 cities × 5
+
+# ── Phân tích cặp category hay đi cùng nhau (A→B) ────────────────────────
+print("Top cặp category (A → B) hay xuất hiện trong motif:")
+category_pair_freq = (
+    motifs_all
+    .groupBy("city", "cat_A", "cat_B")
+    .count()
+    .withColumnRenamed("count", "freq")
+    .orderBy("city", F.col("freq").desc())
+)
+category_pair_freq.show(40, truncate=False)
+
+# ── Lưu kết quả motif ─────────────────────────────────────────────────────
+motifs_all.write.mode("overwrite").partitionBy("city") \
+    .parquet(str(output_path / "motifs_all"))
+
+top_motifs_per_city.write.mode("overwrite") \
+    .parquet(str(output_path / "motifs_top5_per_city"))
+
+category_pair_freq.write.mode("overwrite") \
+    .parquet(str(output_path / "motif_category_pairs"))
+
+# Lưu CSV tóm tắt để xem nhanh
+motif_city_count.toPandas().to_csv(
+    output_path / "motif_city_summary.csv", index=False)
+top_motifs_per_city.toPandas().to_csv(
+    output_path / "motif_top5_per_city.csv", index=False)
+category_pair_freq.toPandas().to_csv(
+    output_path / "motif_category_pairs.csv", index=False)
+
+print(f"\n✓ Đã lưu motif outputs:")
+for name in ["motifs_all/", "motifs_top5_per_city/",
+             "motif_category_pairs/", "motif_city_summary.csv",
+             "motif_top5_per_city.csv", "motif_category_pairs.csv"]:
+    print(f"  {name}")
+
+motifs_all.unpersist()
